@@ -28,6 +28,8 @@ parser.add_argument("--use_point_map", action="store_true", help="Use point map 
 parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out")
 parser.add_argument("--vis_stride", type=int, default=1, help="Stride interval in the 3D point cloud image for visualization. Try increasing (such as 4) to reduce lag in visualizing large maps.")
 parser.add_argument("--vis_point_size", type=float, default=0.003, help="Visualization point size")
+parser.add_argument("--vis_color_mode", type=str, default="image", choices=["image", "frame"], help="Point cloud coloring mode: image RGB or frame-wise color")
+parser.add_argument("--vis_uncertainty", type=str, default="red", choices=["red", "white"], help="How to render uncertainty-mask points: red or white")
 
 
 def main():
@@ -45,6 +47,8 @@ def main():
         gradio_mode=False,
         vis_stride = args.vis_stride,
         vis_point_size = args.vis_point_size,
+        vis_color_mode = args.vis_color_mode,
+        vis_uncertainty = args.vis_uncertainty,
     )
 
     # print("Initializing and loading DepthAnythingV3 model...")

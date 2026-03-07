@@ -196,7 +196,9 @@ class Solver:
         use_sim3: bool = False,
         gradio_mode: bool = False,
         vis_stride: int = 1,
-        vis_point_size: float = 0.001):
+        vis_point_size: float = 0.001,
+        vis_color_mode: str = "image",
+        vis_uncertainty: str = "red"):
         
         self.init_conf_threshold = init_conf_threshold
         self.use_point_map = use_point_map
@@ -224,6 +226,12 @@ class Solver:
         self.prior_conf = None
         self.vis_stride = vis_stride
         self.vis_point_size = vis_point_size
+        self.vis_color_mode = vis_color_mode
+        self.vis_uncertainty = vis_uncertainty
+        if self.vis_color_mode not in ["image", "frame"]:
+            raise ValueError(f"Unsupported vis_color_mode: {self.vis_color_mode}")
+        if self.vis_uncertainty not in ["red", "white"]:
+            raise ValueError(f"Unsupported vis_uncertainty: {self.vis_uncertainty}")
 
         print("Starting viser server...")
 
@@ -240,10 +248,44 @@ class Solver:
             )
 
     def set_submap_point_cloud(self, submap):
-        points_in_world_frame = submap.get_points_in_world_frame(stride = self.vis_stride)
-        points_colors = submap.get_points_colors(stride = self.vis_stride)
+        if self.vis_color_mode == "frame":
+            points_in_world_frame, points_colors = self._get_framewise_colored_points(submap)
+        else:
+            points_in_world_frame = submap.get_points_in_world_frame(stride = self.vis_stride)
+            points_colors = submap.get_points_colors(stride = self.vis_stride)
         name = str(submap.get_id())
         self.set_point_cloud(points_in_world_frame, points_colors, name, self.vis_point_size)
+
+    def _get_framewise_colored_points(self, submap):
+        pointclouds, _, conf_masks = submap.get_points_list_in_world_frame(ignore_loop_closure_frames=True)
+        num_frames = len(pointclouds)
+        if num_frames == 0:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
+
+        cmap = plt.get_cmap("turbo")
+        all_points = []
+        all_colors = []
+
+        for frame_idx, (pointcloud, conf_mask) in enumerate(zip(pointclouds, conf_masks)):
+            if self.vis_stride > 1:
+                pointcloud = pointcloud[::self.vis_stride, ::self.vis_stride, :]
+                conf_mask = conf_mask[::self.vis_stride, ::self.vis_stride]
+
+            frame_points = pointcloud[conf_mask]
+            if frame_points.shape[0] == 0:
+                continue
+
+            color_ratio = 0.0 if num_frames == 1 else frame_idx / (num_frames - 1)
+            frame_color = np.array(cmap(color_ratio)[:3], dtype=np.float32)
+            frame_colors = np.repeat(frame_color[None, :], frame_points.shape[0], axis=0)
+
+            all_points.append(frame_points)
+            all_colors.append(frame_colors)
+
+        if len(all_points) == 0:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
+
+        return np.concatenate(all_points, axis=0), np.concatenate(all_colors, axis=0)
 
     def set_submap_poses(self, submap):
         extrinsics = submap.get_all_poses_world()
@@ -273,7 +315,7 @@ class Solver:
             pred_dict (dict):
             {
                 "images": (S, 3, H, W)   - Input images,
-                "mask": (S, H, W)        - Segmentation mask (0/1),
+                "mask": (S, H, W)        - Uncertainty mask (0/1),
                 "world_points": (S, H, W, 3),
                 "world_points_conf": (S, H, W),
                 "depth": (S, H, W, 1),
@@ -299,9 +341,12 @@ class Solver:
 
         colors = (images.transpose(0, 2, 3, 1) * 255).astype(np.uint8)
 
-        # Apply mask to turn dynamic objects red
+        # Overlay uncertainty mask based on visualization option.
         is_dynamic = mask > 0.5
-        colors[is_dynamic] = [255, 0, 0]
+        if self.vis_uncertainty == "red":
+            colors[is_dynamic] = [255, 0, 0]
+        elif self.vis_uncertainty == "white":
+            colors[is_dynamic] = [255, 255, 255]
 
         cam_to_world = closed_form_inverse_se3(extrinsics_cam)
         points_in_first_cam = world_points[0,...]
@@ -424,11 +469,17 @@ class Solver:
         depth_raw = torch.from_numpy(da3_out.depth).to(device)
         conf_raw = torch.from_numpy(da3_out.conf).to(device)
         
-        if hasattr(da3_out, 'motion_seg_mask') and da3_out.motion_seg_mask is not None:
-             mask_raw = da3_out.motion_seg_mask.to(device).float()
+        # Use uncertainty segmentation mask from DynaDA3 uncertainty head:
+        # class 1 (uncertain) will be rendered as red in add_points().
+        if hasattr(da3_out, 'uncertainty_seg_mask') and da3_out.uncertainty_seg_mask is not None:
+            uncertainty_mask_raw = da3_out.uncertainty_seg_mask
+            if isinstance(uncertainty_mask_raw, np.ndarray):
+                mask_raw = torch.from_numpy(uncertainty_mask_raw).to(device).float()
+            else:
+                mask_raw = uncertainty_mask_raw.to(device).float()
         else:
-             print("Warning: No motion_seg_mask found, using zeros.")
-             mask_raw = torch.zeros_like(depth_raw)
+            print("Warning: No uncertainty_seg_mask found, using zeros.")
+            mask_raw = torch.zeros_like(depth_raw)
 
         if depth_raw.shape[0] == S and depth_raw.dim() == 3:
             _, H_out, W_out = depth_raw.shape
