@@ -11,7 +11,7 @@ from src.da3_slam.solver import Solver
 
 # from depth_anything_3.api import DepthAnything3
 from src.dyna_da3.DynaDA3_model import DynaDA3
-
+from depth_anything_3.utils.logger import logger
 
 parser = argparse.ArgumentParser(description="DA3-SLAM demo")
 parser.add_argument("--image_folder", type=str, default="../dataset/2077/2077_scene1", help="")
@@ -29,7 +29,8 @@ parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial 
 parser.add_argument("--vis_stride", type=int, default=1, help="Stride interval in the 3D point cloud image for visualization. Try increasing (such as 4) to reduce lag in visualizing large maps.")
 parser.add_argument("--vis_point_size", type=float, default=0.003, help="Visualization point size")
 parser.add_argument("--vis_color_mode", type=str, default="image", choices=["image", "frame"], help="Point cloud coloring mode: image RGB or frame-wise color")
-parser.add_argument("--vis_uncertainty", type=str, default="red", choices=["red", "white"], help="How to render uncertainty-mask points: red or white")
+parser.add_argument("--vis_uncertainty", type=str, default="red", choices=["red", "white", "transparent"], help="How to render uncertainty-mask points: red, white, or transparent")
+parser.add_argument("--save_pointcloud_path", type=str, default="", help="Output path for final point cloud. Supports .glb (recommended), plus Open3D formats such as .ply/.pcd and .npz.")
 
 
 def main():
@@ -101,6 +102,10 @@ def main():
         
     print("Total number of submaps in map", solver.map.get_num_submaps())
     print("Total number of loop closures in map", solver.graph.get_num_loops())
+
+    if args.save_pointcloud_path:
+        exported_path = solver.export_3d_scene(args.save_pointcloud_path)
+        print(f"Saved final point cloud to: {exported_path}")
 
 
 if __name__ == "__main__":

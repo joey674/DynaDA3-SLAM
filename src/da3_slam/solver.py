@@ -11,7 +11,7 @@ from typing import Dict, List
 
 from src.vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
 from src.vggt.utils.load_fn import load_and_preprocess_images
-from src.vggt.utils.pose_enc import pose_encoding_to_extri_intri
+# from src.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 from src.da3_slam.loop_closure import ImageRetrieval
 from src.da3_slam.frame_overlap import FrameTracker
@@ -38,7 +38,7 @@ class Viewer:
         self.server = viser.ViserServer(host="0.0.0.0", port=port)
         self.server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
-        # --- [新增] 1. 全局控制：显示/隐藏动态物体 ---
+        # 全局控制：显示/隐藏动态物体 
         self.gui_show_dynamic = self.server.gui.add_checkbox(
             "Show Dynamic Objects",
             initial_value=True,
@@ -56,7 +56,7 @@ class Viewer:
         self.submap_frames: Dict[int, List[viser.FrameHandle]] = {}
         self.submap_frustums: Dict[int, List[viser.CameraFrustumHandle]] = {}
         
-        # --- [新增] 2. 存储动态点云的 Handle，以便统一控制显隐 ---
+        # 存储动态点云的 Handle，以便统一控制显隐 
         self.dynamic_pcd_handles: List[viser.PointCloudHandle] = []
 
         num_rand_colors = 250
@@ -116,23 +116,30 @@ class Viewer:
             frustum.visible = self.gui_show_frames.value
             self.submap_frustums[submap_id].append(frustum)
     
-    # --- [新增] 3. 封装添加点云的逻辑，自动分离静态和动态 ---
-    def add_split_point_cloud(self, name: str, points: np.ndarray, colors: np.ndarray, point_size: float):
+    # 封装添加点云的逻辑，自动分离静态和动态 ---
+    def add_split_point_cloud(
+        self,
+        name: str,
+        points: np.ndarray,
+        colors: np.ndarray,
+        point_size: float,
+        dynamic_mask: np.ndarray = None,
+        render_dynamic: bool = True,
+    ):
         """
-        根据颜色（纯红色 [255, 0, 0]）自动分离静态和动态点云，并添加到 Viser。
+        按 dynamic mask 分离静态/动态点云；缺失时退回到旧的红色检测逻辑。
         """
-        # 检测红色点 (Dynamic)
-        # colors 是 float [0,1] 还是 uint8 [0,255]? 根据 submap.py 来看通常是 float, 
-        # 但在 solver.add_points 里转成了 uint8。这里为了稳健，先转为 uint8 判断。
-        
-        colors_uint8 = colors
-        if colors.max() <= 1.01:
-             colors_uint8 = (colors * 255).astype(np.uint8)
+        if dynamic_mask is None:
+            colors_uint8 = colors
+            if colors.max() <= 1.01:
+                colors_uint8 = (colors * 255).astype(np.uint8)
+            else:
+                colors_uint8 = colors.astype(np.uint8)
+            is_dynamic = (colors_uint8[:, 0] >= 250) & (colors_uint8[:, 1] == 0) & (colors_uint8[:, 2] == 0)
         else:
-             colors_uint8 = colors.astype(np.uint8)
-
-        # 定义红色掩码: R > 200, G < 50, B < 50 (给予少量容差，或者严格匹配 [255, 0, 0])
-        is_dynamic = (colors_uint8[:, 0] >= 250) & (colors_uint8[:, 1] == 0) & (colors_uint8[:, 2] == 0)
+            is_dynamic = np.asarray(dynamic_mask).reshape(-1).astype(bool)
+            if is_dynamic.shape[0] != points.shape[0]:
+                raise ValueError("Dynamic mask length must match point count.")
         
         # 1. 添加静态点 (Static)
         pts_static = points[~is_dynamic]
@@ -151,7 +158,7 @@ class Viewer:
         pts_dynamic = points[is_dynamic]
         col_dynamic = colors[is_dynamic]
 
-        if len(pts_dynamic) > 0:
+        if render_dynamic and len(pts_dynamic) > 0:
             handle = self.server.scene.add_point_cloud(
                 name=f"pcd_{name}_dynamic",
                 points=pts_dynamic,
@@ -173,7 +180,7 @@ class Viewer:
             for fr in frustums:
                 fr.visible = visible
 
-    # --- [新增] 4. 更新回调：点击按钮时，批量修改动态点云可见性 ---
+    # 更新回调：点击按钮时，批量修改动态点云可见性 ---
     def _on_update_show_dynamic(self, _) -> None:
         visible = self.gui_show_dynamic.value
         # 遍历所有已添加的动态点云 Handle，设置可见性
@@ -230,46 +237,60 @@ class Solver:
         self.vis_uncertainty = vis_uncertainty
         if self.vis_color_mode not in ["image", "frame"]:
             raise ValueError(f"Unsupported vis_color_mode: {self.vis_color_mode}")
-        if self.vis_uncertainty not in ["red", "white"]:
+        if self.vis_uncertainty not in ["red", "white", "transparent"]:
             raise ValueError(f"Unsupported vis_uncertainty: {self.vis_uncertainty}")
 
         print("Starting viser server...")
 
-    def set_point_cloud(self, points_in_world_frame, points_colors, name, point_size):
+    def set_point_cloud(self, points_in_world_frame, points_colors, name, point_size, dynamic_mask=None):
         if self.gradio_mode:
-            self.viewer.add_point_cloud(points_in_world_frame, points_colors)
+            self.viewer.add_point_cloud(
+                points_in_world_frame,
+                points_colors,
+                dynamic_mask=dynamic_mask,
+                transparent_dynamic=self.vis_uncertainty == "transparent",
+            )
         else:
-            # --- [修改] 调用 Viewer 的智能分离方法，而不是直接调用 server ---
             self.viewer.add_split_point_cloud(
                 name=name,
                 points=points_in_world_frame,
                 colors=points_colors,
-                point_size=point_size
+                point_size=point_size,
+                dynamic_mask=dynamic_mask,
+                render_dynamic=self.vis_uncertainty != "transparent",
             )
 
     def set_submap_point_cloud(self, submap):
         if self.vis_color_mode == "frame":
-            points_in_world_frame, points_colors = self._get_framewise_colored_points(submap)
+            points_in_world_frame, points_colors, dynamic_mask = self._get_framewise_colored_points(submap)
         else:
             points_in_world_frame = submap.get_points_in_world_frame(stride = self.vis_stride)
             points_colors = submap.get_points_colors(stride = self.vis_stride)
+            dynamic_mask = submap.get_points_dynamic_mask(stride = self.vis_stride)
         name = str(submap.get_id())
-        self.set_point_cloud(points_in_world_frame, points_colors, name, self.vis_point_size)
+        self.set_point_cloud(points_in_world_frame, points_colors, name, self.vis_point_size, dynamic_mask=dynamic_mask)
 
     def _get_framewise_colored_points(self, submap):
         pointclouds, _, conf_masks = submap.get_points_list_in_world_frame(ignore_loop_closure_frames=True)
+        dynamic_masks = submap.get_dynamic_mask_list(ignore_loop_closure_frames=True)
         num_frames = len(pointclouds)
         if num_frames == 0:
-            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
+            return (
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype=bool),
+            )
 
         cmap = plt.get_cmap("turbo")
         all_points = []
         all_colors = []
+        all_dynamic_masks = []
 
-        for frame_idx, (pointcloud, conf_mask) in enumerate(zip(pointclouds, conf_masks)):
+        for frame_idx, (pointcloud, conf_mask, dynamic_mask) in enumerate(zip(pointclouds, conf_masks, dynamic_masks)):
             if self.vis_stride > 1:
                 pointcloud = pointcloud[::self.vis_stride, ::self.vis_stride, :]
                 conf_mask = conf_mask[::self.vis_stride, ::self.vis_stride]
+                dynamic_mask = dynamic_mask[::self.vis_stride, ::self.vis_stride]
 
             frame_points = pointcloud[conf_mask]
             if frame_points.shape[0] == 0:
@@ -278,14 +299,29 @@ class Solver:
             color_ratio = 0.0 if num_frames == 1 else frame_idx / (num_frames - 1)
             frame_color = np.array(cmap(color_ratio)[:3], dtype=np.float32)
             frame_colors = np.repeat(frame_color[None, :], frame_points.shape[0], axis=0)
+            frame_dynamic_mask = dynamic_mask[conf_mask].astype(bool)
+
+            if self.vis_uncertainty == "red":
+                frame_colors[frame_dynamic_mask] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            elif self.vis_uncertainty == "white":
+                frame_colors[frame_dynamic_mask] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
 
             all_points.append(frame_points)
             all_colors.append(frame_colors)
+            all_dynamic_masks.append(frame_dynamic_mask)
 
         if len(all_points) == 0:
-            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32)
+            return (
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype=bool),
+            )
 
-        return np.concatenate(all_points, axis=0), np.concatenate(all_colors, axis=0)
+        return (
+            np.concatenate(all_points, axis=0),
+            np.concatenate(all_colors, axis=0),
+            np.concatenate(all_dynamic_masks, axis=0),
+        )
 
     def set_submap_poses(self, submap):
         extrinsics = submap.get_all_poses_world()
@@ -297,7 +333,9 @@ class Solver:
             self.viewer.visualize_frames(extrinsics, images, submap.get_id())
 
     def export_3d_scene(self, output_path="output.glb"):
-        return self.viewer.export(output_path)
+        if self.gradio_mode:
+            return self.viewer.export(output_path)
+        return self.map.write_points_to_file(output_path, vis_uncertainty=self.vis_uncertainty)
 
     def update_all_submap_vis(self):
         for submap in self.map.get_submaps():
@@ -399,6 +437,7 @@ class Solver:
         self.current_working_submap.add_all_poses(cam_to_world)
         self.current_working_submap.add_all_points(world_points, colors, conf, self.init_conf_threshold, intrinsics_cam)
         self.current_working_submap.set_conf_masks(conf)
+        self.current_working_submap.set_dynamic_masks(is_dynamic)
 
         for index, loop in enumerate(detected_loops):
             assert loop.query_submap_id == self.current_working_submap.get_id()
@@ -469,8 +508,8 @@ class Solver:
         depth_raw = torch.from_numpy(da3_out.depth).to(device)
         conf_raw = torch.from_numpy(da3_out.conf).to(device)
         
-        # Use uncertainty segmentation mask from DynaDA3 uncertainty head:
-        # class 1 (uncertain) will be rendered as red in add_points().
+        # Use uncertainty segmentation mask from DynaDA3 uncertainty head.
+        # Class 1 (uncertain) is rendered according to `vis_uncertainty`.
         if hasattr(da3_out, 'uncertainty_seg_mask') and da3_out.uncertainty_seg_mask is not None:
             uncertainty_mask_raw = da3_out.uncertainty_seg_mask
             if isinstance(uncertainty_mask_raw, np.ndarray):

@@ -18,11 +18,27 @@ class TrimeshViewer:
 
         self.scene.add_geometry(cam_frame)
 
-    def add_point_cloud(self, points: np.ndarray, colors: np.ndarray = None):
+    def add_point_cloud(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray = None,
+        dynamic_mask: np.ndarray = None,
+        transparent_dynamic: bool = False,
+    ):
         """
         points: (N, 3)
         colors: (N, 3) uint8 or float
         """
+        if colors is not None and colors.size > 0 and transparent_dynamic and dynamic_mask is not None:
+            if colors.max() <= 1.0:
+                colors_uint8 = np.clip(colors * 255.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                colors_uint8 = np.clip(colors, 0.0, 255.0).astype(np.uint8)
+
+            alpha = np.full((colors_uint8.shape[0], 1), 255, dtype=np.uint8)
+            alpha[np.asarray(dynamic_mask).reshape(-1).astype(bool)] = 0
+            colors = np.concatenate([colors_uint8, alpha], axis=1)
+
         point_cloud = trimesh.points.PointCloud(points, colors=colors)
         self.scene.add_geometry(point_cloud)
 

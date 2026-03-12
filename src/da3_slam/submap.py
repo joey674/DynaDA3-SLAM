@@ -17,6 +17,7 @@ class Submap:
         self.colors = None # (S, H, W, 3)
         self.conf = None # (S, H, W)
         self.conf_masks = None # (S, H, W)
+        self.dynamic_masks = None # (S, H, W)
         self.conf_threshold = None
         self.pointclouds = None # (S, H, W, 3)
         self.voxelized_points = None
@@ -104,6 +105,9 @@ class Submap:
     def set_conf_masks(self, conf_masks):
         self.conf_masks = conf_masks
 
+    def set_dynamic_masks(self, dynamic_masks):
+        self.dynamic_masks = dynamic_masks.astype(bool)
+
     def get_reference_homography(self):
         return self.H_world_map
 
@@ -120,7 +124,10 @@ class Submap:
             return data[init_conf_mask]
         else:
             conf_sub = self.conf[:, ::stride, ::stride]
-            data_sub = data[:, ::stride, ::stride, :]
+            if data.ndim == 4:
+                data_sub = data[:, ::stride, ::stride, :]
+            else:
+                data_sub = data[:, ::stride, ::stride]
 
             init_conf_mask = conf_sub >= self.conf_threshold
             return data_sub[init_conf_mask]
@@ -180,3 +187,21 @@ class Submap:
         colors = self.filter_data_by_confidence(self.colors, stride)
         return colors.reshape(-1, 3)
 
+    def get_points_dynamic_mask(self, stride = 1):
+        dynamic_masks = self.dynamic_masks
+        if dynamic_masks is None:
+            dynamic_masks = np.zeros_like(self.conf, dtype=bool)
+        dynamic_mask = self.filter_data_by_confidence(dynamic_masks, stride)
+        return dynamic_mask.reshape(-1).astype(bool)
+
+    def get_dynamic_mask_list(self, ignore_loop_closure_frames=False):
+        frame_dynamic_mask = []
+        dynamic_masks = self.dynamic_masks
+        if dynamic_masks is None:
+            dynamic_masks = np.zeros_like(self.conf, dtype=bool)
+
+        for index, dynamic_mask in enumerate(dynamic_masks):
+            frame_dynamic_mask.append(dynamic_mask.astype(bool))
+            if ignore_loop_closure_frames and index == self.last_non_loop_frame_index:
+                break
+        return frame_dynamic_mask

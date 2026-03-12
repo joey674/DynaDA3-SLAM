@@ -96,19 +96,131 @@ class GraphMap:
                 # save pcd as numpy array
                 np.savez(f"{file_name}/{frame_id}.npz", pointcloud=pointcloud, mask=conf_masks)
                 
-
-    def write_points_to_file(self, file_name):
+    def _collect_points_and_colors(self):
         pcd_all = []
         colors_all = []
+        dynamic_masks_all = []
         for submap in self.ordered_submaps_by_key():
-            pcd = submap.get_points_in_world_frame()
-            pcd = pcd.reshape(-1, 3)
+            pcd = submap.get_points_in_world_frame().reshape(-1, 3)
+            colors = submap.get_points_colors().reshape(-1, 3)
+            dynamic_mask = submap.get_points_dynamic_mask().reshape(-1)
             pcd_all.append(pcd)
-            colors_all.append(submap.get_points_colors())
+            colors_all.append(colors)
+            dynamic_masks_all.append(dynamic_mask)
+
+        if len(pcd_all) == 0:
+            raise RuntimeError("No submaps available. Run reconstruction before exporting point cloud.")
+
         pcd_all = np.concatenate(pcd_all, axis=0)
         colors_all = np.concatenate(colors_all, axis=0)
-        if colors_all.max() > 1.0:
-            colors_all = colors_all / 255.0
-        pcd_all = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd_all))
-        pcd_all.colors = o3d.utility.Vector3dVector(colors_all)
-        o3d.io.write_point_cloud(file_name, pcd_all)
+        dynamic_masks_all = np.concatenate(dynamic_masks_all, axis=0).astype(bool)
+        return pcd_all, colors_all, dynamic_masks_all
+
+    def _collect_camera_poses(self):
+        pose_list = []
+        for submap in self.ordered_submaps_by_key():
+            poses = submap.get_all_poses_world(ignore_loop_closure_frames=True)
+            if poses is None or len(poses) == 0:
+                continue
+            pose_list.append(poses)
+
+        if len(pose_list) == 0:
+            return np.empty((0, 4, 4), dtype=np.float32)
+        return np.concatenate(pose_list, axis=0).astype(np.float32)
+
+    def _create_camera_frustum_wireframe(self, trimesh_module, marker_size=0.05):
+        depth = marker_size
+        half_w = marker_size * 0.45
+        half_h = marker_size * 0.30
+
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [-half_w, -half_h, depth],
+                [half_w, -half_h, depth],
+                [half_w, half_h, depth],
+                [-half_w, half_h, depth],
+            ],
+            dtype=np.float32,
+        )
+        edges = [
+            (0, 1), (0, 2), (0, 3), (0, 4),
+            (1, 2), (2, 3), (3, 4), (4, 1),
+        ]
+        line_radius = max(marker_size * 0.03, 1e-4)
+        line_meshes = []
+        for start_idx, end_idx in edges:
+            segment = np.array([vertices[start_idx], vertices[end_idx]], dtype=np.float32)
+            edge_mesh = trimesh_module.creation.cylinder(radius=line_radius, segment=segment, sections=10)
+            edge_mesh.visual.face_colors = np.array([40, 170, 255, 255], dtype=np.uint8)
+            line_meshes.append(edge_mesh)
+        return trimesh_module.util.concatenate(line_meshes)
+
+    def _export_glb(self, file_name, points, colors, camera_poses=None, camera_marker_size=0.05):
+        import trimesh
+
+        if colors.max() <= 1.0:
+            colors_uint8 = np.clip(colors * 255.0, 0.0, 255.0).astype(np.uint8)
+        else:
+            colors_uint8 = np.clip(colors, 0.0, 255.0).astype(np.uint8)
+
+        scene = trimesh.Scene()
+        point_cloud = trimesh.points.PointCloud(points.astype(np.float32), colors=colors_uint8)
+        scene.add_geometry(point_cloud, geom_name="reconstructed_pointcloud")
+
+        if camera_poses is not None and len(camera_poses) > 0:
+            base_frustum = self._create_camera_frustum_wireframe(trimesh, marker_size=camera_marker_size)
+            for idx, pose in enumerate(camera_poses):
+                cam_frustum = base_frustum.copy()
+                cam_frustum.apply_transform(pose)
+                scene.add_geometry(cam_frustum, geom_name=f"camera_pose_{idx}")
+
+        scene.export(file_name)
+
+    def _export_open3d(self, file_name, points, colors):
+        if colors.max() > 1.0:
+            colors = colors / 255.0
+        pcd_all = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        pcd_all.colors = o3d.utility.Vector3dVector(colors)
+        success = o3d.io.write_point_cloud(file_name, pcd_all)
+        if not success:
+            raise RuntimeError(f"Failed to write point cloud to {file_name}.")
+        return file_name
+
+
+    def write_points_to_file(self, file_name, vis_uncertainty="red"):
+        output_dir = os.path.dirname(file_name)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        points, colors, dynamic_mask = self._collect_points_and_colors()
+        ext = os.path.splitext(file_name)[1].lower()
+
+        if vis_uncertainty == "transparent":
+            if ext == ".glb":
+                if colors.max() <= 1.0:
+                    colors_uint8 = np.clip(colors * 255.0, 0.0, 255.0).astype(np.uint8)
+                else:
+                    colors_uint8 = np.clip(colors, 0.0, 255.0).astype(np.uint8)
+                alpha = np.full((colors_uint8.shape[0], 1), 255, dtype=np.uint8)
+                alpha[dynamic_mask] = 0
+                colors = np.concatenate([colors_uint8, alpha], axis=1)
+            elif ext != ".npz":
+                points = points[~dynamic_mask]
+                colors = colors[~dynamic_mask]
+
+        if ext == ".glb":
+            camera_poses = self._collect_camera_poses()
+            try:
+                self._export_glb(file_name, points, colors, camera_poses=camera_poses)
+                return file_name
+            except ModuleNotFoundError as exc:
+                fallback_file_name = os.path.splitext(file_name)[0] + ".ply"
+                print(f"[Warning] {exc}. Falling back to {fallback_file_name}")
+                return self._export_open3d(fallback_file_name, points, colors)
+
+        if ext == ".npz":
+            np.savez(file_name, pointcloud=points, colors=colors, dynamic_mask=dynamic_mask)
+            return file_name
+
+        return self._export_open3d(file_name, points, colors)

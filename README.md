@@ -22,5 +22,9 @@ pip install -e ../DynaDA3
 python3 main.py  
 python3 main.py --image_folder ../dataset/wildgs-slam/wildgs_racket_test
 python3 main.py --image_folder ../dataset/UKA/UKA_Case1Part1Scene1
+python3 main.py --image_folder ../dataset/2077/2077_scene1
+
+--save_pointcloud_path ./outputs/final_map.glb 
+--vis_uncertainty transparent  # or white / transparent
 
 ```
