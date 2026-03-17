@@ -4,6 +4,8 @@ import torch
 import open3d as o3d
 from scipy.spatial.transform import Rotation as R
 
+from src.da3_slam.slam_utils import apply_point_visualization
+
 class GraphMap:
     def __init__(self):
         self.submaps = dict()
@@ -100,13 +102,16 @@ class GraphMap:
         pcd_all = []
         colors_all = []
         dynamic_masks_all = []
+        low_conf_masks_all = []
         for submap in self.ordered_submaps_by_key():
-            pcd = submap.get_points_in_world_frame().reshape(-1, 3)
-            colors = submap.get_points_colors().reshape(-1, 3)
-            dynamic_mask = submap.get_points_dynamic_mask().reshape(-1)
+            pcd = submap.get_points_in_world_frame(include_low_conf=True).reshape(-1, 3)
+            colors = submap.get_points_colors(include_low_conf=True).reshape(-1, 3)
+            dynamic_mask = submap.get_points_dynamic_mask(include_low_conf=True).reshape(-1)
+            low_conf_mask = submap.get_points_low_conf_mask(include_low_conf=True).reshape(-1)
             pcd_all.append(pcd)
             colors_all.append(colors)
             dynamic_masks_all.append(dynamic_mask)
+            low_conf_masks_all.append(low_conf_mask)
 
         if len(pcd_all) == 0:
             raise RuntimeError("No submaps available. Run reconstruction before exporting point cloud.")
@@ -114,7 +119,8 @@ class GraphMap:
         pcd_all = np.concatenate(pcd_all, axis=0)
         colors_all = np.concatenate(colors_all, axis=0)
         dynamic_masks_all = np.concatenate(dynamic_masks_all, axis=0).astype(bool)
-        return pcd_all, colors_all, dynamic_masks_all
+        low_conf_masks_all = np.concatenate(low_conf_masks_all, axis=0).astype(bool)
+        return pcd_all, colors_all, dynamic_masks_all, low_conf_masks_all
 
     def _collect_camera_poses(self):
         pose_list = []
@@ -188,39 +194,51 @@ class GraphMap:
         return file_name
 
 
-    def write_points_to_file(self, file_name, vis_uncertainty="red"):
+    def write_points_to_file(self, file_name, vis_uncertainty="red", vis_low_conf="transparent"):
         output_dir = os.path.dirname(file_name)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        points, colors, dynamic_mask = self._collect_points_and_colors()
+        points, colors, dynamic_mask, low_conf_mask = self._collect_points_and_colors()
+        colors, transparent_mask = apply_point_visualization(
+            colors,
+            dynamic_mask=dynamic_mask,
+            low_conf_mask=low_conf_mask,
+            vis_uncertainty=vis_uncertainty,
+            vis_low_conf=vis_low_conf,
+        )
         ext = os.path.splitext(file_name)[1].lower()
 
-        if vis_uncertainty == "transparent":
-            if ext == ".glb":
-                if colors.max() <= 1.0:
-                    colors_uint8 = np.clip(colors * 255.0, 0.0, 255.0).astype(np.uint8)
-                else:
-                    colors_uint8 = np.clip(colors, 0.0, 255.0).astype(np.uint8)
-                alpha = np.full((colors_uint8.shape[0], 1), 255, dtype=np.uint8)
-                alpha[dynamic_mask] = 0
-                colors = np.concatenate([colors_uint8, alpha], axis=1)
-            elif ext != ".npz":
-                points = points[~dynamic_mask]
-                colors = colors[~dynamic_mask]
-
         if ext == ".glb":
+            if colors.max() <= 1.0:
+                colors_uint8 = np.clip(colors * 255.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                colors_uint8 = np.clip(colors, 0.0, 255.0).astype(np.uint8)
+            alpha = np.full((colors_uint8.shape[0], 1), 255, dtype=np.uint8)
+            alpha[transparent_mask] = 0
+            colors_rgba = np.concatenate([colors_uint8, alpha], axis=1)
             camera_poses = self._collect_camera_poses()
             try:
-                self._export_glb(file_name, points, colors, camera_poses=camera_poses)
+                self._export_glb(file_name, points, colors_rgba, camera_poses=camera_poses)
                 return file_name
             except ModuleNotFoundError as exc:
                 fallback_file_name = os.path.splitext(file_name)[0] + ".ply"
                 print(f"[Warning] {exc}. Falling back to {fallback_file_name}")
-                return self._export_open3d(fallback_file_name, points, colors)
+                return self._export_open3d(
+                    fallback_file_name,
+                    points[~transparent_mask],
+                    colors[~transparent_mask],
+                )
 
         if ext == ".npz":
-            np.savez(file_name, pointcloud=points, colors=colors, dynamic_mask=dynamic_mask)
+            np.savez(
+                file_name,
+                pointcloud=points,
+                colors=colors,
+                dynamic_mask=dynamic_mask,
+                low_conf_mask=low_conf_mask,
+                transparent_mask=transparent_mask,
+            )
             return file_name
 
-        return self._export_open3d(file_name, points, colors)
+        return self._export_open3d(file_name, points[~transparent_mask], colors[~transparent_mask])

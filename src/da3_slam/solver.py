@@ -19,6 +19,7 @@ from src.da3_slam.map import GraphMap
 from src.da3_slam.submap import Submap
 from src.da3_slam.h_solve import ransac_projective
 from src.da3_slam.gradio_viewer import TrimeshViewer
+from src.da3_slam.slam_utils import apply_point_visualization
 
 def color_point_cloud_by_confidence(pcd, confidence, cmap='viridis'):
     """
@@ -45,6 +46,12 @@ class Viewer:
         )
         self.gui_show_dynamic.on_update(self._on_update_show_dynamic)
 
+        self.gui_show_low_conf = self.server.gui.add_checkbox(
+            "Show Low Conf Objects",
+            initial_value=True,
+        )
+        self.gui_show_low_conf.on_update(self._on_update_show_low_conf)
+
         # Global toggle for all frames and frustums
         self.gui_show_frames = self.server.gui.add_checkbox(
             "Show Cameras",
@@ -58,6 +65,7 @@ class Viewer:
         
         # 存储动态点云的 Handle，以便统一控制显隐 
         self.dynamic_pcd_handles: List[viser.PointCloudHandle] = []
+        self.low_conf_pcd_handles: List[viser.PointCloudHandle] = []
 
         num_rand_colors = 250
         self.random_colors = np.random.randint(0, 256, size=(num_rand_colors, 3), dtype=np.uint8)
@@ -124,10 +132,11 @@ class Viewer:
         colors: np.ndarray,
         point_size: float,
         dynamic_mask: np.ndarray = None,
+        low_conf_mask: np.ndarray = None,
         render_dynamic: bool = True,
     ):
         """
-        按 dynamic mask 分离静态/动态点云；缺失时退回到旧的红色检测逻辑。
+        按 dynamic / low-confidence mask 分离点云。
         """
         if dynamic_mask is None:
             colors_uint8 = colors
@@ -140,10 +149,20 @@ class Viewer:
             is_dynamic = np.asarray(dynamic_mask).reshape(-1).astype(bool)
             if is_dynamic.shape[0] != points.shape[0]:
                 raise ValueError("Dynamic mask length must match point count.")
+
+        if low_conf_mask is None:
+            is_low_conf = np.zeros((points.shape[0],), dtype=bool)
+        else:
+            is_low_conf = np.asarray(low_conf_mask).reshape(-1).astype(bool)
+            if is_low_conf.shape[0] != points.shape[0]:
+                raise ValueError("Low-confidence mask length must match point count.")
+
+        low_conf_only = is_low_conf & ~is_dynamic
+        is_static = ~(is_dynamic | low_conf_only)
         
         # 1. 添加静态点 (Static)
-        pts_static = points[~is_dynamic]
-        col_static = colors[~is_dynamic]
+        pts_static = points[is_static]
+        col_static = colors[is_static]
         
         if len(pts_static) > 0:
             self.server.scene.add_point_cloud(
@@ -154,7 +173,22 @@ class Viewer:
                 point_shape="circle",
             )
 
-        # 2. 添加动态点 (Dynamic)
+        # 2. 添加低置信度点 (Low Confidence)
+        pts_low_conf = points[low_conf_only]
+        col_low_conf = colors[low_conf_only]
+
+        if len(pts_low_conf) > 0:
+            handle = self.server.scene.add_point_cloud(
+                name=f"pcd_{name}_low_conf",
+                points=pts_low_conf,
+                colors=col_low_conf,
+                point_size=point_size,
+                point_shape="circle",
+            )
+            self.low_conf_pcd_handles.append(handle)
+            handle.visible = self.gui_show_low_conf.value
+
+        # 3. 添加动态点 (Dynamic)
         pts_dynamic = points[is_dynamic]
         col_dynamic = colors[is_dynamic]
 
@@ -194,6 +228,17 @@ class Viewer:
                 pass # Handle 可能已经失效
         self.dynamic_pcd_handles = valid_handles
 
+    def _on_update_show_low_conf(self, _) -> None:
+        visible = self.gui_show_low_conf.value
+        valid_handles = []
+        for handle in self.low_conf_pcd_handles:
+            try:
+                handle.visible = visible
+                valid_handles.append(handle)
+            except:
+                pass
+        self.low_conf_pcd_handles = valid_handles
+
 
 class Solver:
     def __init__(self,
@@ -205,7 +250,8 @@ class Solver:
         vis_stride: int = 1,
         vis_point_size: float = 0.001,
         vis_color_mode: str = "image",
-        vis_uncertainty: str = "red"):
+        vis_uncertainty: str = "red",
+        vis_low_conf: str = "transparent"):
         
         self.init_conf_threshold = init_conf_threshold
         self.use_point_map = use_point_map
@@ -235,14 +281,25 @@ class Solver:
         self.vis_point_size = vis_point_size
         self.vis_color_mode = vis_color_mode
         self.vis_uncertainty = vis_uncertainty
+        self.vis_low_conf = vis_low_conf
         if self.vis_color_mode not in ["image", "frame"]:
             raise ValueError(f"Unsupported vis_color_mode: {self.vis_color_mode}")
         if self.vis_uncertainty not in ["red", "white", "transparent"]:
             raise ValueError(f"Unsupported vis_uncertainty: {self.vis_uncertainty}")
+        if self.vis_low_conf not in ["red", "white", "transparent"]:
+            raise ValueError(f"Unsupported vis_low_conf: {self.vis_low_conf}")
 
         print("Starting viser server...")
 
-    def set_point_cloud(self, points_in_world_frame, points_colors, name, point_size, dynamic_mask=None):
+    def set_point_cloud(
+        self,
+        points_in_world_frame,
+        points_colors,
+        name,
+        point_size,
+        dynamic_mask=None,
+        low_conf_mask=None,
+    ):
         if self.gradio_mode:
             self.viewer.add_point_cloud(
                 points_in_world_frame,
@@ -257,27 +314,45 @@ class Solver:
                 colors=points_colors,
                 point_size=point_size,
                 dynamic_mask=dynamic_mask,
+                low_conf_mask=low_conf_mask,
                 render_dynamic=self.vis_uncertainty != "transparent",
             )
 
     def set_submap_point_cloud(self, submap):
         if self.vis_color_mode == "frame":
-            points_in_world_frame, points_colors, dynamic_mask = self._get_framewise_colored_points(submap)
+            points_in_world_frame, base_colors, dynamic_mask, low_conf_mask = self._get_framewise_colored_points(submap)
         else:
-            points_in_world_frame = submap.get_points_in_world_frame(stride = self.vis_stride)
-            points_colors = submap.get_points_colors(stride = self.vis_stride)
-            dynamic_mask = submap.get_points_dynamic_mask(stride = self.vis_stride)
+            points_in_world_frame = submap.get_points_in_world_frame(stride=self.vis_stride, include_low_conf=True)
+            base_colors = submap.get_points_colors(stride=self.vis_stride, include_low_conf=True)
+            dynamic_mask = submap.get_points_dynamic_mask(stride=self.vis_stride, include_low_conf=True)
+            low_conf_mask = submap.get_points_low_conf_mask(stride=self.vis_stride, include_low_conf=True)
+
+        points_colors, hidden_mask = apply_point_visualization(
+            base_colors,
+            dynamic_mask=dynamic_mask,
+            low_conf_mask=low_conf_mask,
+            vis_uncertainty=self.vis_uncertainty,
+            vis_low_conf=self.vis_low_conf,
+        )
+        visible_mask = ~hidden_mask
         name = str(submap.get_id())
-        self.set_point_cloud(points_in_world_frame, points_colors, name, self.vis_point_size, dynamic_mask=dynamic_mask)
+        self.set_point_cloud(
+            points_in_world_frame[visible_mask],
+            points_colors[visible_mask],
+            name,
+            self.vis_point_size,
+            dynamic_mask=dynamic_mask[visible_mask],
+            low_conf_mask=low_conf_mask[visible_mask],
+        )
 
     def _get_framewise_colored_points(self, submap):
-        pointclouds, _, conf_masks = submap.get_points_list_in_world_frame(ignore_loop_closure_frames=True)
-        dynamic_masks = submap.get_dynamic_mask_list(ignore_loop_closure_frames=True)
-        num_frames = len(pointclouds)
+        frame_data = list(submap.iter_frame_point_data(ignore_loop_closure_frames=True, stride=self.vis_stride))
+        num_frames = len(frame_data)
         if num_frames == 0:
             return (
                 np.empty((0, 3), dtype=np.float32),
                 np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype=bool),
                 np.empty((0,), dtype=bool),
             )
 
@@ -285,35 +360,29 @@ class Solver:
         all_points = []
         all_colors = []
         all_dynamic_masks = []
+        all_low_conf_masks = []
 
-        for frame_idx, (pointcloud, conf_mask, dynamic_mask) in enumerate(zip(pointclouds, conf_masks, dynamic_masks)):
-            if self.vis_stride > 1:
-                pointcloud = pointcloud[::self.vis_stride, ::self.vis_stride, :]
-                conf_mask = conf_mask[::self.vis_stride, ::self.vis_stride]
-                dynamic_mask = dynamic_mask[::self.vis_stride, ::self.vis_stride]
-
-            frame_points = pointcloud[conf_mask]
+        for frame_idx, (pointcloud, _, _, low_conf_mask, dynamic_mask) in enumerate(frame_data):
+            frame_points = pointcloud.reshape(-1, 3)
             if frame_points.shape[0] == 0:
                 continue
 
             color_ratio = 0.0 if num_frames == 1 else frame_idx / (num_frames - 1)
             frame_color = np.array(cmap(color_ratio)[:3], dtype=np.float32)
             frame_colors = np.repeat(frame_color[None, :], frame_points.shape[0], axis=0)
-            frame_dynamic_mask = dynamic_mask[conf_mask].astype(bool)
-
-            if self.vis_uncertainty == "red":
-                frame_colors[frame_dynamic_mask] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-            elif self.vis_uncertainty == "white":
-                frame_colors[frame_dynamic_mask] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            frame_dynamic_mask = dynamic_mask.reshape(-1).astype(bool)
+            frame_low_conf_mask = low_conf_mask.reshape(-1).astype(bool)
 
             all_points.append(frame_points)
             all_colors.append(frame_colors)
             all_dynamic_masks.append(frame_dynamic_mask)
+            all_low_conf_masks.append(frame_low_conf_mask)
 
         if len(all_points) == 0:
             return (
                 np.empty((0, 3), dtype=np.float32),
                 np.empty((0, 3), dtype=np.float32),
+                np.empty((0,), dtype=bool),
                 np.empty((0,), dtype=bool),
             )
 
@@ -321,6 +390,7 @@ class Solver:
             np.concatenate(all_points, axis=0),
             np.concatenate(all_colors, axis=0),
             np.concatenate(all_dynamic_masks, axis=0),
+            np.concatenate(all_low_conf_masks, axis=0),
         )
 
     def set_submap_poses(self, submap):
@@ -335,7 +405,11 @@ class Solver:
     def export_3d_scene(self, output_path="output.glb"):
         if self.gradio_mode:
             return self.viewer.export(output_path)
-        return self.map.write_points_to_file(output_path, vis_uncertainty=self.vis_uncertainty)
+        return self.map.write_points_to_file(
+            output_path,
+            vis_uncertainty=self.vis_uncertainty,
+            vis_low_conf=self.vis_low_conf,
+        )
 
     def update_all_submap_vis(self):
         for submap in self.map.get_submaps():
@@ -379,12 +453,7 @@ class Solver:
 
         colors = (images.transpose(0, 2, 3, 1) * 255).astype(np.uint8)
 
-        # Overlay uncertainty mask based on visualization option.
         is_dynamic = mask > 0.5
-        if self.vis_uncertainty == "red":
-            colors[is_dynamic] = [255, 0, 0]
-        elif self.vis_uncertainty == "white":
-            colors[is_dynamic] = [255, 255, 255]
 
         cam_to_world = closed_form_inverse_se3(extrinsics_cam)
         points_in_first_cam = world_points[0,...]

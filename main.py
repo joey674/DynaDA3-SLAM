@@ -25,12 +25,17 @@ parser.add_argument("--downsample_factor", type=int, default=1, help="Factor to 
 parser.add_argument("--max_loops", type=int, default=1, help="Maximum number of loop closures per submap")
 parser.add_argument("--min_disparity", type=float, default=50, help="Minimum disparity to generate a new keyframe")
 parser.add_argument("--use_point_map", action="store_true", help="Use point map instead of depth-based points")
-parser.add_argument("--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out")
-parser.add_argument("--vis_stride", type=int, default=1, help="Stride interval in the 3D point cloud image for visualization. Try increasing (such as 4) to reduce lag in visualizing large maps.")
+
+parser.add_argument("--vis_stride", type=int, default=1, help="Stride interval in the 3D point cloud image for visualization. Try increasing (such as 4) to reduce lag in visualizing large maps.") # 这个是可视化时点云数据的采样间隔, 可以适当开一点, 能减少大地图可视化时的卡顿
 parser.add_argument("--vis_point_size", type=float, default=0.003, help="Visualization point size")
-parser.add_argument("--vis_color_mode", type=str, default="image", choices=["image", "frame"], help="Point cloud coloring mode: image RGB or frame-wise color")
-parser.add_argument("--vis_uncertainty", type=str, default="red", choices=["red", "white", "transparent"], help="How to render uncertainty-mask points: red, white, or transparent")
-parser.add_argument("--save_pointcloud_path", type=str, default="", help="Output path for final point cloud. Supports .glb (recommended), plus Open3D formats such as .ply/.pcd and .npz.")
+parser.add_argument("--vis_color_mode", type=str, default="image", choices=["image", "frame"], help="Point cloud coloring mode: image RGB or frame-wise color") # 选择frame就会使每帧分配不同颜色点云, 选择image就会使来自图像RGB的点云颜色
+
+### 这些功能可以不用, 都集成到了web面板的工具栏里了 可以在工具栏使用
+parser.add_argument("--vis_uncertainty", type=str, default="red", choices=["red", "white", "transparent"], help="How to render uncertainty-mask points: red, white, or transparent") # 这个是uncertaintyhead输出的动态遮罩的点的渲染颜色;
+parser.add_argument("--low_conf", type=float, default=15, help="Initial percentile threshold used to mark low-confidence points") # 这个阈值用于判定基于模型本身输出的低置信度点, 不再在可视化时直接删掉, 而是交给 vis_low_conf 控制渲染方式
+parser.add_argument("--vis_low_conf", type=str, default="red", choices=["red", "white", "transparent"], help="How to render low-confidence points selected by --low_conf: red, white, or transparent") # 这个是基于 low_conf 判定出的低置信度点的渲染颜色
+
+parser.add_argument("--save_pointcloud_path", type=str, default="", help="Output path for final point cloud. Supports .glb (recommended), plus Open3D formats such as .ply/.pcd and .npz.") # 保存的点云数据路径; 如果有才保存 没有默认不保存
 
 
 def main():
@@ -42,7 +47,7 @@ def main():
     print(f"Using device: {device}")
 
     solver = Solver(
-        init_conf_threshold=args.conf_threshold,
+        init_conf_threshold=args.low_conf,
         use_point_map=args.use_point_map,
         use_sim3=args.use_sim3,
         gradio_mode=False,
@@ -50,6 +55,7 @@ def main():
         vis_point_size = args.vis_point_size,
         vis_color_mode = args.vis_color_mode,
         vis_uncertainty = args.vis_uncertainty,
+        vis_low_conf = args.vis_low_conf,
     )
 
     # print("Initializing and loading DepthAnythingV3 model...")

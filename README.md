@@ -1,6 +1,8 @@
-# DynaDA3
+# DynaDA3-SLAM
 
 ## deploy
+this project should be installed along with DynaDA3.
+
 ```bash
 ### conda
 sudo apt-get update
@@ -25,6 +27,5 @@ python3 main.py --image_folder ../dataset/UKA/UKA_Case1Part1Scene1
 python3 main.py --image_folder ../dataset/2077/2077_scene1
 
 --save_pointcloud_path ./outputs/final_map.glb 
---vis_uncertainty transparent  # or white / transparent
 
 ```

@@ -118,19 +118,47 @@ class Submap:
         # Note this does not include any of the loop closure frames
         return self.frame_ids
 
-    def filter_data_by_confidence(self, data, stride = 1):
+    def _subsample_data(self, data, stride=1):
         if stride == 1:
-            init_conf_mask = self.conf >= self.conf_threshold
-            return data[init_conf_mask]
-        else:
-            conf_sub = self.conf[:, ::stride, ::stride]
-            if data.ndim == 4:
-                data_sub = data[:, ::stride, ::stride, :]
-            else:
-                data_sub = data[:, ::stride, ::stride]
+            return data
+        if data.ndim == 4:
+            return data[:, ::stride, ::stride, :]
+        return data[:, ::stride, ::stride]
 
-            init_conf_mask = conf_sub >= self.conf_threshold
-            return data_sub[init_conf_mask]
+    def get_confidence_mask(self, stride=1):
+        conf_sub = self._subsample_data(self.conf, stride)
+        return conf_sub >= self.conf_threshold
+
+    def get_low_confidence_mask(self, stride=1):
+        return ~self.get_confidence_mask(stride)
+
+    def filter_data_by_confidence(self, data, stride = 1, include_low_conf: bool = False):
+        data_sub = self._subsample_data(data, stride)
+        if include_low_conf:
+            return data_sub
+        init_conf_mask = self.get_confidence_mask(stride)
+        return data_sub[init_conf_mask]
+
+    def iter_frame_point_data(self, ignore_loop_closure_frames=False, stride=1):
+        dynamic_masks = self.dynamic_masks
+        if dynamic_masks is None:
+            dynamic_masks = np.zeros_like(self.conf, dtype=bool)
+
+        for index, points in enumerate(self.pointclouds):
+            points_flat = points.reshape(-1, 3)
+            points_homogeneous = np.hstack([points_flat, np.ones((points_flat.shape[0], 1))])
+            points_transformed = (self.H_world_map @ points_homogeneous.T).T
+            pointcloud_world = (points_transformed[:, :3] / points_transformed[:, 3:]).reshape(points.shape)
+
+            pointcloud_world = self._subsample_data(pointcloud_world[None, ...], stride)[0]
+            conf_mask = self._subsample_data((self.conf[index] >= self.conf_threshold)[None, ...], stride)[0]
+            low_conf_mask = self._subsample_data((self.conf[index] < self.conf_threshold)[None, ...], stride)[0]
+            dynamic_mask = self._subsample_data(dynamic_masks[index][None, ...], stride)[0].astype(bool)
+
+            frame_id = self.frame_ids[index] if index < len(self.frame_ids) else None
+            yield pointcloud_world, frame_id, conf_mask, low_conf_mask, dynamic_mask
+            if ignore_loop_closure_frames and index == self.last_non_loop_frame_index:
+                break
 
     def get_points_list_in_world_frame(self, ignore_loop_closure_frames=False):
         point_list = []
@@ -141,15 +169,16 @@ class Submap:
             points_homogeneous = np.hstack([points_flat, np.ones((points_flat.shape[0], 1))])
             points_transformed = (self.H_world_map @ points_homogeneous.T).T
             point_list.append((points_transformed[:, :3] / points_transformed[:, 3:]).reshape(points.shape))
-            frame_id_list.append(self.frame_ids[index])
-            conf_mask = self.conf_masks[index] >= self.conf_threshold
+            frame_id = self.frame_ids[index] if index < len(self.frame_ids) else None
+            frame_id_list.append(frame_id)
+            conf_mask = self.conf[index] >= self.conf_threshold
             frame_conf_mask.append(conf_mask)
             if ignore_loop_closure_frames and index == self.last_non_loop_frame_index:
                 break
         return point_list, frame_id_list, frame_conf_mask
 
-    def get_points_in_world_frame(self, stride = 1):
-        points = self.filter_data_by_confidence(self.pointclouds, stride)
+    def get_points_in_world_frame(self, stride = 1, include_low_conf: bool = False):
+        points = self.filter_data_by_confidence(self.pointclouds, stride, include_low_conf=include_low_conf)
 
         points_flat = points.reshape(-1, 3)
         points_homogeneous = np.hstack([points_flat, np.ones((points_flat.shape[0], 1))])
@@ -183,16 +212,22 @@ class Submap:
         voxelized_points_in_world_frame.colors = self.voxelized_points.colors
         return voxelized_points_in_world_frame
     
-    def get_points_colors(self, stride = 1):
-        colors = self.filter_data_by_confidence(self.colors, stride)
+    def get_points_colors(self, stride = 1, include_low_conf: bool = False):
+        colors = self.filter_data_by_confidence(self.colors, stride, include_low_conf=include_low_conf)
         return colors.reshape(-1, 3)
 
-    def get_points_dynamic_mask(self, stride = 1):
+    def get_points_dynamic_mask(self, stride = 1, include_low_conf: bool = False):
         dynamic_masks = self.dynamic_masks
         if dynamic_masks is None:
             dynamic_masks = np.zeros_like(self.conf, dtype=bool)
-        dynamic_mask = self.filter_data_by_confidence(dynamic_masks, stride)
+        dynamic_mask = self.filter_data_by_confidence(dynamic_masks, stride, include_low_conf=include_low_conf)
         return dynamic_mask.reshape(-1).astype(bool)
+
+    def get_points_low_conf_mask(self, stride = 1, include_low_conf: bool = False):
+        low_conf_mask = self.get_low_confidence_mask(stride)
+        if include_low_conf:
+            return low_conf_mask.reshape(-1).astype(bool)
+        return low_conf_mask[self.get_confidence_mask(stride)].reshape(-1).astype(bool)
 
     def get_dynamic_mask_list(self, ignore_loop_closure_frames=False):
         frame_dynamic_mask = []
